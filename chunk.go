@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/binary"
+	"io"
 	"os"
 	"sync"
 )
@@ -16,13 +19,23 @@ const (
 	stateGrass   uint32 = 9
 	stateDirt    uint32 = 10
 	stateBedrock uint32 = 85
+
+	chunkMagic uint32 = 0xFFFFFFFF
 )
 
+var skyLightFullArray = bytes.Repeat([]byte{0xFF}, 2048)
+
+type ChunkSection struct {
+	uniform    bool
+	blockState uint32
+	blocks     *[16][16][16]uint32
+}
+
 type Chunk struct {
-	mu     sync.RWMutex
-	x, z   int
-	blocks [16][worldHeight][16]uint32
-	cached []byte
+	mu       sync.RWMutex
+	x, z     int
+	sections [numSections]*ChunkSection
+	cached   []byte
 }
 
 type World struct {
@@ -34,29 +47,87 @@ func getChunkKey(x, z int) uint64 {
 	return (uint64(uint32(x)) << 32) | uint64(uint32(z))
 }
 
+func (c *Chunk) GetBlock(x, localY, z int) uint32 {
+	secIdx := localY / 16
+	if secIdx < 0 || secIdx >= numSections {
+		return stateAir
+	}
+	sec := c.sections[secIdx]
+	if sec == nil {
+		return stateAir
+	}
+	if sec.uniform {
+		return sec.blockState
+	}
+	if sec.blocks == nil {
+		return stateAir
+	}
+	secY := localY % 16
+	return sec.blocks[x][secY][z]
+}
+
+func (c *Chunk) SetBlock(x, localY, z int, stateID uint32) {
+	secIdx := localY / 16
+	if secIdx < 0 || secIdx >= numSections {
+		return
+	}
+	secY := localY % 16
+	sec := c.sections[secIdx]
+	if sec == nil {
+		if stateID == stateAir {
+			return
+		}
+		sec = &ChunkSection{uniform: true, blockState: stateAir}
+		c.sections[secIdx] = sec
+	}
+
+	if sec.uniform {
+		if sec.blockState == stateID {
+			return
+		}
+		sec.blocks = new([16][16][16]uint32)
+		oldState := sec.blockState
+		if oldState != stateAir {
+			for bx := 0; bx < 16; bx++ {
+				for by := 0; by < 16; by++ {
+					for bz := 0; bz < 16; bz++ {
+						sec.blocks[bx][by][bz] = oldState
+					}
+				}
+			}
+		}
+		sec.uniform = false
+	}
+
+	if sec.blocks == nil {
+		sec.blocks = new([16][16][16]uint32)
+	}
+
+	sec.blocks[x][secY][z] = stateID
+	c.cached = nil
+}
+
 func NewWorld() *World {
 	w := &World{
 		chunks: make(map[uint64]*Chunk),
 	}
-	
+
 	err := w.Load("world.bin")
 	if err == nil && len(w.chunks) > 0 {
 		return w
 	}
-	
-	// Generate chunks based on config if not loaded
+
 	radius := serverConfig.Chunks
 	if radius <= 0 {
-		radius = 1 // Default
+		radius = 1
 	}
-	// A radius of 1 means just chunk (0,0)? Actually chunks=1 means 1 chunk. chunks=4 means 4x4.
-	// We'll interpret serverConfig.Chunks as a radius or grid size. Let's do a square grid centered at 0,0
+
 	half := serverConfig.Chunks / 2
 	startX := -half
 	endX := startX + serverConfig.Chunks
 	startZ := -half
 	endZ := startZ + serverConfig.Chunks
-	
+
 	if serverConfig.Chunks == 1 {
 		startX, endX = 0, 1
 		startZ, endZ = 0, 1
@@ -65,25 +136,34 @@ func NewWorld() *World {
 	for cx := startX; cx < endX; cx++ {
 		for cz := startZ; cz < endZ; cz++ {
 			c := &Chunk{x: cx, z: cz}
+
+			sec0 := &ChunkSection{uniform: false, blocks: new([16][16][16]uint32)}
 			for x := 0; x < 16; x++ {
 				for z := 0; z < 16; z++ {
-					for y := 0; y < worldHeight; y++ {
-						absY := y + worldMinY
-						switch {
-						case absY == worldMinY:
-							c.blocks[x][y][z] = stateBedrock
-						case absY < 0:
-							c.blocks[x][y][z] = stateDirt
-						case absY < 4:
-							c.blocks[x][y][z] = stateDirt
-						case absY == 4:
-							c.blocks[x][y][z] = stateGrass
-						default:
-							c.blocks[x][y][z] = stateAir
-						}
+					sec0.blocks[x][0][z] = stateBedrock
+					for y := 1; y < 16; y++ {
+						sec0.blocks[x][y][z] = stateDirt
 					}
 				}
 			}
+			c.sections[0] = sec0
+
+			c.sections[1] = &ChunkSection{uniform: true, blockState: stateDirt}
+			c.sections[2] = &ChunkSection{uniform: true, blockState: stateDirt}
+			c.sections[3] = &ChunkSection{uniform: true, blockState: stateDirt}
+
+			sec4 := &ChunkSection{uniform: false, blocks: new([16][16][16]uint32)}
+			for x := 0; x < 16; x++ {
+				for z := 0; z < 16; z++ {
+					sec4.blocks[x][0][z] = stateDirt
+					sec4.blocks[x][1][z] = stateDirt
+					sec4.blocks[x][2][z] = stateDirt
+					sec4.blocks[x][3][z] = stateDirt
+					sec4.blocks[x][4][z] = stateGrass
+				}
+			}
+			c.sections[4] = sec4
+
 			w.chunks[getChunkKey(cx, cz)] = c
 		}
 	}
@@ -97,21 +177,110 @@ func (w *World) Load(filename string) error {
 	}
 	defer f.Close()
 
-	var numChunks uint32
-	if err := binary.Read(f, binary.LittleEndian, &numChunks); err != nil {
+	var header [2]byte
+	_, err = io.ReadFull(f, header[:])
+	if err != nil {
 		return err
 	}
+	_, _ = f.Seek(0, io.SeekStart)
+
+	var r io.Reader = f
+	if header[0] == 0x1f && header[1] == 0x8b {
+		gr, err := gzip.NewReader(f)
+		if err != nil {
+			return err
+		}
+		defer gr.Close()
+		r = gr
+	}
+
+	var firstWord uint32
+	if err := binary.Read(r, binary.LittleEndian, &firstWord); err != nil {
+		return err
+	}
+
+	if firstWord == chunkMagic {
+		var numChunks uint32
+		if err := binary.Read(r, binary.LittleEndian, &numChunks); err != nil {
+			return err
+		}
+		for i := uint32(0); i < numChunks; i++ {
+			var x, z int32
+			if err := binary.Read(r, binary.LittleEndian, &x); err != nil {
+				return err
+			}
+			if err := binary.Read(r, binary.LittleEndian, &z); err != nil {
+				return err
+			}
+			c := &Chunk{x: int(x), z: int(z)}
+			for sec := 0; sec < numSections; sec++ {
+				var kind byte
+				if err := binary.Read(r, binary.LittleEndian, &kind); err != nil {
+					return err
+				}
+				if kind == 1 {
+					var st uint32
+					if err := binary.Read(r, binary.LittleEndian, &st); err != nil {
+						return err
+					}
+					c.sections[sec] = &ChunkSection{uniform: true, blockState: st}
+				} else if kind == 2 {
+					secObj := &ChunkSection{uniform: false, blocks: new([16][16][16]uint32)}
+					if err := binary.Read(r, binary.LittleEndian, secObj.blocks); err != nil {
+						return err
+					}
+					c.sections[sec] = secObj
+				}
+			}
+			w.chunks[getChunkKey(int(x), int(z))] = c
+		}
+		return nil
+	}
+
+	numChunks := firstWord
 	for i := uint32(0); i < numChunks; i++ {
 		var x, z int32
-		if err := binary.Read(f, binary.LittleEndian, &x); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &x); err != nil {
 			return err
 		}
-		if err := binary.Read(f, binary.LittleEndian, &z); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &z); err != nil {
 			return err
 		}
+		var oldBlocks [16][worldHeight][16]uint32
+		if err := binary.Read(r, binary.LittleEndian, &oldBlocks); err != nil {
+			return err
+		}
+
 		c := &Chunk{x: int(x), z: int(z)}
-		if err := binary.Read(f, binary.LittleEndian, &c.blocks); err != nil {
-			return err
+		for sec := 0; sec < numSections; sec++ {
+			baseY := sec * 16
+			var firstState uint32
+			allSame := true
+			allAir := true
+			secBlocks := new([16][16][16]uint32)
+			for localY := 0; localY < 16; localY++ {
+				for bx := 0; bx < 16; bx++ {
+					for bz := 0; bz < 16; bz++ {
+						st := oldBlocks[bx][baseY+localY][bz]
+						secBlocks[bx][localY][bz] = st
+						if bx == 0 && localY == 0 && bz == 0 {
+							firstState = st
+						} else if st != firstState {
+							allSame = false
+						}
+						if st != stateAir {
+							allAir = false
+						}
+					}
+				}
+			}
+			if allAir {
+				c.sections[sec] = nil
+			} else if allSame {
+				c.sections[sec] = &ChunkSection{uniform: true, blockState: firstState}
+			} else {
+				c.sections[sec] = &ChunkSection{uniform: false, blocks: secBlocks}
+			}
 		}
 		w.chunks[getChunkKey(int(x), int(z))] = c
 	}
@@ -128,22 +297,55 @@ func (w *World) Save(filename string) error {
 	}
 	defer f.Close()
 
-	if err := binary.Write(f, binary.LittleEndian, uint32(len(w.chunks))); err != nil {
+	gw := gzip.NewWriter(f)
+	defer gw.Close()
+
+	if err := binary.Write(gw, binary.LittleEndian, chunkMagic); err != nil {
+		return err
+	}
+	if err := binary.Write(gw, binary.LittleEndian, uint32(len(w.chunks))); err != nil {
 		return err
 	}
 	for _, c := range w.chunks {
 		c.mu.RLock()
-		if err := binary.Write(f, binary.LittleEndian, int32(c.x)); err != nil {
+		if err := binary.Write(gw, binary.LittleEndian, int32(c.x)); err != nil {
 			c.mu.RUnlock()
 			return err
 		}
-		if err := binary.Write(f, binary.LittleEndian, int32(c.z)); err != nil {
+		if err := binary.Write(gw, binary.LittleEndian, int32(c.z)); err != nil {
 			c.mu.RUnlock()
 			return err
 		}
-		if err := binary.Write(f, binary.LittleEndian, &c.blocks); err != nil {
-			c.mu.RUnlock()
-			return err
+		for sec := 0; sec < numSections; sec++ {
+			s := c.sections[sec]
+			if s == nil {
+				if err := binary.Write(gw, binary.LittleEndian, byte(0)); err != nil {
+					c.mu.RUnlock()
+					return err
+				}
+			} else if s.uniform {
+				if err := binary.Write(gw, binary.LittleEndian, byte(1)); err != nil {
+					c.mu.RUnlock()
+					return err
+				}
+				if err := binary.Write(gw, binary.LittleEndian, s.blockState); err != nil {
+					c.mu.RUnlock()
+					return err
+				}
+			} else {
+				if err := binary.Write(gw, binary.LittleEndian, byte(2)); err != nil {
+					c.mu.RUnlock()
+					return err
+				}
+				blocksPtr := s.blocks
+				if blocksPtr == nil {
+					blocksPtr = new([16][16][16]uint32)
+				}
+				if err := binary.Write(gw, binary.LittleEndian, blocksPtr); err != nil {
+					c.mu.RUnlock()
+					return err
+				}
+			}
 		}
 		c.mu.RUnlock()
 	}
@@ -170,9 +372,9 @@ func (w *World) GetBlock(x, y, z int) uint32 {
 	}
 	bx := x & 15
 	bz := z & 15
-	
+
 	c.mu.RLock()
-	v := c.blocks[bx][localY][bz]
+	v := c.GetBlock(bx, localY, bz)
 	c.mu.RUnlock()
 	return v
 }
@@ -190,10 +392,9 @@ func (w *World) SetBlock(x, y, z int, stateID uint32) {
 	}
 	bx := x & 15
 	bz := z & 15
-	
+
 	c.mu.Lock()
-	c.blocks[bx][localY][bz] = stateID
-	c.cached = nil
+	c.SetBlock(bx, localY, bz, stateID)
 	c.mu.Unlock()
 }
 
@@ -267,6 +468,18 @@ func encodePalettedContainerDirect(states []uint32) []byte {
 	return out
 }
 
+func encodeBlockSectionUniform(stateID uint32) []byte {
+	var blockCount int16 = 0
+	if stateID != stateAir {
+		blockCount = 4096
+	}
+	var out []byte
+	out = append(out, byte(blockCount>>8), byte(blockCount))
+	out = append(out, encodePalettedContainerSingleValue(stateID)...)
+	out = append(out, encodePalettedContainerSingleValue(0)...)
+	return out
+}
+
 func encodeBlockSection(sectionBlocks []uint32) []byte {
 	nonAir := 0
 	for _, b := range sectionBlocks {
@@ -322,13 +535,23 @@ func (c *Chunk) buildChunkData() []byte {
 	var sectionData []byte
 
 	for sec := 0; sec < numSections; sec++ {
-		baseLocalY := sec * 16
+		s := c.sections[sec]
+		if s == nil {
+			sectionData = append(sectionData, encodeBlockSectionUniform(stateAir)...)
+			continue
+		}
+		if s.uniform {
+			sectionData = append(sectionData, encodeBlockSectionUniform(s.blockState)...)
+			continue
+		}
 		blocks := make([]uint32, sectionVolume)
-		for localY := 0; localY < 16; localY++ {
-			for z := 0; z < 16; z++ {
-				for x := 0; x < 16; x++ {
-					idx := localY*16*16 + z*16 + x
-					blocks[idx] = c.blocks[x][baseLocalY+localY][z]
+		if s.blocks != nil {
+			for localY := 0; localY < 16; localY++ {
+				for z := 0; z < 16; z++ {
+					for x := 0; x < 16; x++ {
+						idx := localY*16*16 + z*16 + x
+						blocks[idx] = s.blocks[x][localY][z]
+					}
 				}
 			}
 		}
@@ -364,13 +587,9 @@ func (c *Chunk) buildChunkData() []byte {
 
 	skyLightCount := numSections + 2
 	data = appendVarInt(data, int32(skyLightCount))
-	skyArray := make([]byte, 2048)
-	for i := range skyArray {
-		skyArray[i] = 0xFF
-	}
 	for i := 0; i < skyLightCount; i++ {
 		data = appendVarInt(data, 2048)
-		data = append(data, skyArray...)
+		data = append(data, skyLightFullArray...)
 	}
 
 	data = appendVarInt(data, 0)
@@ -404,10 +623,29 @@ func computeHeightmap(c *Chunk, motionBlocking bool) []int64 {
 	for z := 0; z < 16; z++ {
 		for x := 0; x < 16; x++ {
 			height := 0
-			for y := worldHeight - 1; y >= 0; y-- {
-				b := c.blocks[x][y][z]
-				if b != stateAir {
-					height = y + worldMinY + 1
+			for sec := numSections - 1; sec >= 0; sec-- {
+				s := c.sections[sec]
+				if s == nil {
+					continue
+				}
+				if s.uniform {
+					if s.blockState != stateAir {
+						height = (sec+1)*16 + worldMinY
+						break
+					}
+					continue
+				}
+				found := false
+				if s.blocks != nil {
+					for y := 15; y >= 0; y-- {
+						if s.blocks[x][y][z] != stateAir {
+							height = sec*16 + y + worldMinY + 1
+							found = true
+							break
+						}
+					}
+				}
+				if found {
 					break
 				}
 			}

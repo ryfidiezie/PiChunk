@@ -163,6 +163,9 @@ func (c *Client) handleConfiguration() error {
 	if err := sendKnownPacks(c.writer); err != nil {
 		return err
 	}
+	if err := sendConfigBrand(c.writer, "PiChunk"); err != nil {
+		return err
+	}
 	if err := c.writer.Flush(); err != nil {
 		return err
 	}
@@ -199,8 +202,11 @@ func (c *Client) handlePlay() error {
 	c.pitch = 0
 	c.lastX, c.lastY, c.lastZ = c.x, c.y, c.z
 
-	c.gamemode = 1 // Creative by default
+	c.gamemode = 1
 	if err := sendLoginPlay(c.writer, c.eid, c.gamemode); err != nil {
+		return err
+	}
+	if err := sendPlayBrand(c.writer, "PiChunk"); err != nil {
 		return err
 	}
 	if err := sendSetDefaultSpawn(c.writer); err != nil {

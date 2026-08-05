@@ -10,11 +10,12 @@ const (
 	loginPacketID_LoginSuccess = 0x02
 	loginPacketID_Disconnect   = 0x00
 
-	configCBPacketID_FinishConfig = 0x03
-	configCBPacketID_RegistryData = 0x07
-	configCBPacketID_FeatureFlags = 0x0C
-	configCBPacketID_UpdateTags   = 0x0D
-	configCBPacketID_KnownPacks   = 0x0E
+	configCBPacketID_CustomPayload = 0x01
+	configCBPacketID_FinishConfig  = 0x03
+	configCBPacketID_RegistryData  = 0x07
+	configCBPacketID_FeatureFlags  = 0x0C
+	configCBPacketID_UpdateTags    = 0x0D
+	configCBPacketID_KnownPacks    = 0x0E
 
 	configSBPacketID_AckFinishConfig = 0x03
 	configSBPacketID_KnownPacks      = 0x07
@@ -22,6 +23,7 @@ const (
 	playPacketID_SpawnEntity      = 0x01
 	playPacketID_EntityAnimation  = 0x03
 	playPacketID_BlockUpdate      = 0x09
+	playPacketID_CustomPayload    = 0x19
 	playPacketID_GameEvent        = 0x23
 	playPacketID_KeepAlive        = 0x27
 	playPacketID_ChunkData        = 0x28
@@ -337,7 +339,21 @@ func sendEntityMetadata(bw *bufio.Writer, eid int32, flags byte, pose int32) err
 	p = appendVarInt(p, 21)
 	p = appendVarInt(p, pose)
 	
-	p = appendByte(p, 0xFF) // End of metadata array
+	p = appendByte(p, 0xFF)
 	
 	return sendPacket(bw, playPacketID_EntityMetadata, p)
+}
+
+func sendConfigBrand(bw *bufio.Writer, brand string) error {
+	var p []byte
+	p = appendString(p, "minecraft:brand")
+	p = appendString(p, brand)
+	return sendPacket(bw, configCBPacketID_CustomPayload, p)
+}
+
+func sendPlayBrand(bw *bufio.Writer, brand string) error {
+	var p []byte
+	p = appendString(p, "minecraft:brand")
+	p = appendString(p, brand)
+	return sendPacket(bw, playPacketID_CustomPayload, p)
 }

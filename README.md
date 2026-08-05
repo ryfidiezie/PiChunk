@@ -1,11 +1,11 @@
 <div align="center">
   <img src="logo.png" alt="PiChunk Logo" width="200" />
   <h1>PiChunk</h1>
-  <p><i>A minimal Minecraft 1.21.4 (Java Edition) server built for the Raspberry Pi Zero W.</i></p>
+  <p><i>A minimal Minecraft 1.21.4 (Java Edition) server built for horrible devices with low ram and cpu</i></p>
 </div>
 
 ***
-
+# NOTE: THIS SHOULD NOT BE USED FOR A PRODUCTION SERVER
 ## Overview
 
 PiChunk is a zero-dependency Minecraft server written in Go. It implements a minimal subset of the modern 1.21.4 (Protocol 769) Minecraft protocol to run on extremely low-end hardware. 

@@ -61,3 +61,21 @@ Since PiChunk is written in Go, you can cross-compile it for the Pi Zero W (whic
 
 ```bash
 # On Windows PowerShell
+$env:GOOS="linux"
+$env:GOARCH="arm"
+$env:GOARM="6"
+go build -o bin/pichunk_arm6 ./...
+```
+
+Transfer the binary to your Pi using `scp`:
+
+```bash
+scp bin/pichunk_arm6 pi@YOUR_PI_IP:~/pichunk
+```
+
+On your Pi, make it executable and run it!
+
+```bash
+chmod +x ~/pichunk
+./pichunk
+```

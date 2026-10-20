@@ -18,3 +18,5 @@ Thumbs.db
 vanilla/logs/
 vanilla/world/
 vanilla/usercache.json
+server.properties
+world.bin

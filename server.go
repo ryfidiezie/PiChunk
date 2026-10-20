@@ -5,16 +5,20 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type Server struct {
-	world   *World
-	mu      sync.RWMutex
-	clients map[int32]*Client
-	nextEID atomic.Int32
+	world     *World
+	mu        sync.RWMutex
+	clients   map[int32]*Client
+	nextEID   atomic.Int32
+	worldAge  atomic.Int64
+	worldTime atomic.Int64
+	isRaining atomic.Bool
 }
 
 func NewServer() *Server {
@@ -23,7 +27,25 @@ func NewServer() *Server {
 		clients: make(map[int32]*Client),
 	}
 	s.nextEID.Store(1)
+	s.worldAge.Store(0)
+	s.worldTime.Store(6000) // start at noon
+	go s.timeTicker()
 	return s
+}
+
+func (s *Server) timeTicker() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	counter := 0
+	for range ticker.C {
+		s.worldAge.Add(20)
+		t := (s.worldTime.Add(20)) % 24000
+		s.worldTime.Store(t)
+		counter++
+		if counter%5 == 0 {
+			s.BroadcastTime()
+		}
+	}
 }
 
 func (s *Server) Listen(addr string, gui bool) error {
@@ -47,11 +69,13 @@ func (s *Server) Listen(addr string, gui bool) error {
 		}
 		eid := s.nextEID.Add(1)
 		c := &Client{
-			server: s,
-			conn:   conn,
-			reader: bufio.NewReaderSize(conn, 4096),
-			writer: bufio.NewWriterSize(conn, 32768),
-			eid:    eid,
+			server:               s,
+			conn:                 conn,
+			reader:               bufio.NewReaderSize(conn, 4096),
+			writer:               bufio.NewWriterSize(conn, 32768),
+			eid:                  eid,
+			compressionThreshold: -1,
+			loadedChunks:         make(map[uint64]bool),
 		}
 		go c.Handle()
 	}
@@ -67,6 +91,29 @@ func (s *Server) removeClient(c *Client) {
 	s.mu.Lock()
 	delete(s.clients, c.eid)
 	s.mu.Unlock()
+}
+
+func (s *Server) FindClientByName(name string) *Client {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, c := range s.clients {
+		if strings.EqualFold(c.username, name) && c.inPlay.Load() {
+			return c
+		}
+	}
+	return nil
+}
+
+func (s *Server) GetPlayerNames() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var names []string
+	for _, c := range s.clients {
+		if c.inPlay.Load() {
+			names = append(names, c.username)
+		}
+	}
+	return names
 }
 
 func (s *Server) broadcastExcept(excludeEID int32, fn func(*Client) error) {
@@ -113,7 +160,38 @@ func (s *Server) broadcastAll(fn func(*Client) error) {
 
 func (s *Server) BroadcastBlockUpdate(x, y, z int, stateID uint32) {
 	s.broadcastAll(func(c *Client) error {
-		return sendBlockUpdate(c.writer, x, y, z, stateID)
+		return sendBlockUpdate(c, x, y, z, stateID)
+	})
+}
+
+func (s *Server) BroadcastWorldEvent(effectID int32, x, y, z int, data int32) {
+	s.broadcastAll(func(c *Client) error {
+		return sendWorldEvent(c, effectID, x, y, z, data, false)
+	})
+}
+
+func (s *Server) BroadcastTime() {
+	age := s.worldAge.Load()
+	t := s.worldTime.Load()
+	s.broadcastAll(func(c *Client) error {
+		return sendUpdateTime(c, age, t, true)
+	})
+}
+
+func (s *Server) BroadcastWeather(rain bool) {
+	s.isRaining.Store(rain)
+	var event byte = 1 // clear
+	if rain {
+		event = 2 // rain
+	}
+	s.broadcastAll(func(c *Client) error {
+		return sendGameEvent(c, event, 0)
+	})
+}
+
+func (s *Server) BroadcastPlayerLatency(uuid [16]byte, latency int32) {
+	s.broadcastAll(func(c *Client) error {
+		return sendPlayerLatency(c, uuid, latency)
 	})
 }
 
@@ -124,41 +202,41 @@ func (s *Server) BroadcastChat(senderName, message string) {
 
 func (s *Server) BroadcastSystemMessage(msg string) {
 	s.broadcastAll(func(c *Client) error {
-		return sendSystemChat(c.writer, msg)
+		return sendSystemChat(c, msg)
 	})
 }
 
 func (s *Server) BroadcastEquipment(sender *Client) {
 	itemID := sender.inventory[36+sender.heldSlot]
 	s.broadcastExcept(sender.eid, func(c *Client) error {
-		return sendEntityEquipment(c.writer, sender.eid, 0, itemID)
+		return sendEntityEquipment(c, sender.eid, 0, itemID)
 	})
 }
 
 func (s *Server) BroadcastAnimation(sender *Client, animation byte) {
 	s.broadcastExcept(sender.eid, func(c *Client) error {
-		return sendEntityAnimation(c.writer, sender.eid, animation)
+		return sendEntityAnimation(c, sender.eid, animation)
 	})
 }
 
 func (s *Server) BroadcastMetadata(sender *Client, flags byte, pose int32) {
 	s.broadcastExcept(sender.eid, func(c *Client) error {
-		return sendEntityMetadata(c.writer, sender.eid, flags, pose)
+		return sendEntityMetadata(c, sender.eid, flags, pose)
 	})
 }
 
 func (s *Server) BroadcastSpawnPlayer(newClient *Client) {
 	s.BroadcastSystemMessage(fmt.Sprintf("\u00a7e%s joined the game", newClient.username))
 	s.broadcastExcept(newClient.eid, func(c *Client) error {
-		if err := sendPlayerInfoAdd(c.writer, newClient.uuid, newClient.username, newClient.eid, 1); err != nil {
+		if err := sendPlayerInfoAdd(c, newClient.uuid, newClient.username, newClient.eid, 1); err != nil {
 			return err
 		}
-		if err := sendSpawnEntity(c.writer, newClient.eid, newClient.uuid, 128,
+		if err := sendSpawnEntity(c, newClient.eid, newClient.uuid, 128,
 			newClient.x, newClient.y, newClient.z,
 			newClient.pitch, newClient.yaw, newClient.yaw); err != nil {
 			return err
 		}
-		return sendEntityEquipment(c.writer, newClient.eid, 0, newClient.inventory[36+newClient.heldSlot])
+		return sendEntityEquipment(c, newClient.eid, 0, newClient.inventory[36+newClient.heldSlot])
 	})
 
 	newClient.writeMu.Lock()
@@ -167,13 +245,13 @@ func (s *Server) BroadcastSpawnPlayer(newClient *Client) {
 		if c.eid == newClient.eid || !c.inPlay.Load() {
 			continue
 		}
-		if err := sendPlayerInfoAdd(newClient.writer, c.uuid, c.username, c.eid, 1); err == nil {
-			sendSpawnEntity(newClient.writer, c.eid, c.uuid, 128,
+		if err := sendPlayerInfoAdd(newClient, c.uuid, c.username, c.eid, 1); err == nil {
+			sendSpawnEntity(newClient, c.eid, c.uuid, 128,
 				c.x, c.y, c.z,
 				c.pitch, c.yaw, c.yaw)
-			sendEntityEquipment(newClient.writer, c.eid, 0, c.inventory[36+c.heldSlot])
+			sendEntityEquipment(newClient, c.eid, 0, c.inventory[36+c.heldSlot])
 			if c.crouching {
-				sendEntityMetadata(newClient.writer, c.eid, 0x02, 5)
+				sendEntityMetadata(newClient, c.eid, 0x02, 5)
 			}
 		}
 	}
@@ -184,21 +262,21 @@ func (s *Server) BroadcastSpawnPlayer(newClient *Client) {
 
 func (s *Server) BroadcastRemovePlayer(c *Client) {
 	s.broadcastExcept(c.eid, func(target *Client) error {
-		if err := sendPlayerInfoRemove(target.writer, c.uuid); err != nil {
+		if err := sendPlayerInfoRemove(target, c.uuid); err != nil {
 			return err
 		}
-		return sendRemoveEntities(target.writer, []int32{c.eid})
+		return sendRemoveEntities(target, []int32{c.eid})
 	})
 }
 
 func (s *Server) BroadcastMove(sender *Client) {
 	s.broadcastExcept(sender.eid, func(c *Client) error {
-		if err := sendSyncEntityPosition(c.writer, sender.eid,
+		if err := sendSyncEntityPosition(c, sender.eid,
 			sender.x, sender.y, sender.z,
 			sender.yaw, sender.pitch, sender.onGround); err != nil {
 			return err
 		}
-		return sendEntityHeadLook(c.writer, sender.eid, sender.yaw)
+		return sendEntityHeadLook(c, sender.eid, sender.yaw)
 	})
 }
 
@@ -207,12 +285,15 @@ func (s *Server) keepAliveTicker() {
 	defer ticker.Stop()
 	for range ticker.C {
 		id := newKeepAliveID()
+		now := time.Now().UnixNano()
 		s.broadcastAll(func(c *Client) error {
 			c.lastKeepalive.Store(id)
-			return sendKeepAlive(c.writer, id)
+			c.lastKeepaliveSent.Store(now)
+			return sendKeepAlive(c, id)
 		})
 	}
 }
+
 func (s *Server) getPlayerCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
+	"sync"
 )
 
 func readVarInt(r io.Reader) (int32, error) {
@@ -96,6 +98,10 @@ func appendString(buf []byte, s string) []byte {
 }
 
 func appendUint16BE(buf []byte, v uint16) []byte {
+	return append(buf, byte(v>>8), byte(v))
+}
+
+func appendInt16BE(buf []byte, v int16) []byte {
 	return append(buf, byte(v>>8), byte(v))
 }
 
@@ -226,4 +232,165 @@ func sendPacket(w io.Writer, id int32, payload []byte) error {
 		return err
 	}
 	return nil
+}
+
+var zlibWriterPool = sync.Pool{}
+
+func getZlibWriter(w io.Writer) *zlib.Writer {
+	if zw, ok := zlibWriterPool.Get().(*zlib.Writer); ok && zw != nil {
+		zw.Reset(w)
+		return zw
+	}
+	zw, _ := zlib.NewWriterLevel(w, zlib.BestSpeed)
+	return zw
+}
+
+func putZlibWriter(zw *zlib.Writer) {
+	zlibWriterPool.Put(zw)
+}
+
+func readVarIntFromSlice(data []byte) (value int32, bytesRead int, err error) {
+	var result int32
+	var shift uint
+	for i, b := range data {
+		result |= int32(b&0x7F) << shift
+		if b&0x80 == 0 {
+			return result, i + 1, nil
+		}
+		shift += 7
+		if shift >= 35 {
+			return 0, 0, fmt.Errorf("varint too large")
+		}
+	}
+	return 0, 0, io.ErrUnexpectedEOF
+}
+
+func readPacketWithCompression(r io.Reader, threshold int32) (id int32, data []byte, err error) {
+	if threshold < 0 {
+		return readPacket(r)
+	}
+
+	packetLen, err := readVarInt(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	if packetLen < 1 || packetLen > 1<<21 {
+		return 0, nil, fmt.Errorf("packet length out of range: %d", packetLen)
+	}
+
+	raw := make([]byte, packetLen)
+	if _, err = io.ReadFull(r, raw); err != nil {
+		return 0, nil, err
+	}
+
+	dataLen, n, err := readVarIntFromSlice(raw)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	if dataLen == 0 {
+		br := bytes.NewReader(raw[n:])
+		id, err = readVarInt(br)
+		if err != nil {
+			return 0, nil, err
+		}
+		remaining := make([]byte, br.Len())
+		_, err = io.ReadFull(br, remaining)
+		return id, remaining, err
+	}
+
+	zr, err := zlib.NewReader(bytes.NewReader(raw[n:]))
+	if err != nil {
+		return 0, nil, fmt.Errorf("zlib reader error: %w", err)
+	}
+	defer zr.Close()
+
+	decompressed := make([]byte, dataLen)
+	if _, err = io.ReadFull(zr, decompressed); err != nil {
+		return 0, nil, fmt.Errorf("zlib decompress error: %w", err)
+	}
+
+	br := bytes.NewReader(decompressed)
+	id, err = readVarInt(br)
+	if err != nil {
+		return 0, nil, err
+	}
+	remaining := make([]byte, br.Len())
+	_, err = io.ReadFull(br, remaining)
+	return id, remaining, err
+}
+
+func sendPacketWithCompression(w io.Writer, id int32, payload []byte, threshold int32) error {
+	if threshold < 0 {
+		return sendPacket(w, id, payload)
+	}
+
+	idLen := varIntLen(id)
+	uncompressedLen := idLen + len(payload)
+
+	if int32(uncompressedLen) < threshold {
+		totalLen := varIntLen(0) + uncompressedLen
+		var p []byte
+		p = appendVarInt(p, int32(totalLen))
+		p = appendVarInt(p, 0)
+		p = appendVarInt(p, id)
+		if len(payload) > 0 {
+			p = append(p, payload...)
+		}
+		_, err := w.Write(p)
+		return err
+	}
+
+	var compBuf bytes.Buffer
+	zw := getZlibWriter(&compBuf)
+	compBuf.Reset()
+	zw.Reset(&compBuf)
+
+	var idBuf [5]byte
+	idN := putVarInt(idBuf[:], id)
+	if _, err := zw.Write(idBuf[:idN]); err != nil {
+		putZlibWriter(zw)
+		return err
+	}
+	if len(payload) > 0 {
+		if _, err := zw.Write(payload); err != nil {
+			putZlibWriter(zw)
+			return err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		putZlibWriter(zw)
+		return err
+	}
+	putZlibWriter(zw)
+
+	compressedBytes := compBuf.Bytes()
+	packetLen := varIntLen(int32(uncompressedLen)) + len(compressedBytes)
+
+	var header []byte
+	header = appendVarInt(header, int32(packetLen))
+	header = appendVarInt(header, int32(uncompressedLen))
+	if _, err := w.Write(header); err != nil {
+		return err
+	}
+	_, err := w.Write(compressedBytes)
+	return err
+}
+
+func putVarInt(buf []byte, v int32) int {
+	uv := uint32(v)
+	n := 0
+	for {
+		b := byte(uv & 0x7F)
+		uv >>= 7
+		if uv != 0 {
+			b |= 0x80
+		}
+		buf[n] = b
+		n++
+		if uv == 0 {
+			break
+		}
+	}
+	return n
 }

@@ -8,9 +8,11 @@ import (
 	"log"
 	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Client struct {
@@ -38,6 +40,23 @@ type Client struct {
 	teleportID    atomic.Int32
 	lastKeepalive atomic.Int64
 	inPlay        atomic.Bool
+
+	compressionThreshold int32
+	lastKeepaliveSent    atomic.Int64
+	ping                 atomic.Int32
+
+	loadedChunksMu sync.Mutex
+	loadedChunks   map[uint64]bool
+	lastChunkX     int
+	lastChunkZ     int
+}
+
+func (c *Client) sendPacket(id int32, payload []byte) error {
+	return sendPacketWithCompression(c.writer, id, payload, c.compressionThreshold)
+}
+
+func (c *Client) readPacket() (int32, []byte, error) {
+	return readPacketWithCompression(c.reader, c.compressionThreshold)
 }
 
 func (c *Client) Handle() {
@@ -128,12 +147,22 @@ func (c *Client) handleLogin() error {
 	dr := newDataReader(data)
 	name, _ := dr.readString()
 	if len(name) == 0 || len(name) > 16 {
-		return sendLoginDisconnect(c.writer, "Invalid username")
+		return sendLoginDisconnect(c, "Invalid username")
 	}
 	c.username = name
 	c.uuid = offlineUUID(name)
 
-	if err := sendLoginSuccess(c.writer, c.uuid, name); err != nil {
+	if serverConfig.CompressionThreshold >= 0 {
+		if err := sendLoginCompress(c, int32(serverConfig.CompressionThreshold)); err != nil {
+			return err
+		}
+		if err := c.writer.Flush(); err != nil {
+			return err
+		}
+		c.compressionThreshold = int32(serverConfig.CompressionThreshold)
+	}
+
+	if err := sendLoginSuccess(c, c.uuid, name); err != nil {
 		return err
 	}
 	if err := c.writer.Flush(); err != nil {
@@ -141,7 +170,7 @@ func (c *Client) handleLogin() error {
 	}
 
 	for {
-		ackID, _, err := readPacket(c.reader)
+		ackID, _, err := c.readPacket()
 		if err != nil {
 			return err
 		}
@@ -157,13 +186,13 @@ func (c *Client) handleLogin() error {
 }
 
 func (c *Client) handleConfiguration() error {
-	if err := sendFeatureFlags(c.writer); err != nil {
+	if err := sendFeatureFlags(c); err != nil {
 		return err
 	}
-	if err := sendKnownPacks(c.writer); err != nil {
+	if err := sendKnownPacks(c); err != nil {
 		return err
 	}
-	if err := sendConfigBrand(c.writer, "PiChunk"); err != nil {
+	if err := sendConfigBrand(c, "PiChunk"); err != nil {
 		return err
 	}
 	if err := c.writer.Flush(); err != nil {
@@ -171,16 +200,16 @@ func (c *Client) handleConfiguration() error {
 	}
 
 	for {
-		id, data, err := readPacket(c.reader)
+		id, data, err := c.readPacket()
 		if err != nil {
 			return err
 		}
 		switch id {
 		case configSBPacketID_KnownPacks:
-			if err := sendRegistryPackets(c.writer); err != nil {
+			if err := sendRegistryPackets(c); err != nil {
 				return err
 			}
-			if err := sendFinishConfig(c.writer); err != nil {
+			if err := sendFinishConfig(c); err != nil {
 				return err
 			}
 			if err := c.writer.Flush(); err != nil {
@@ -201,35 +230,33 @@ func (c *Client) handlePlay() error {
 	c.yaw = 0
 	c.pitch = 0
 	c.lastX, c.lastY, c.lastZ = c.x, c.y, c.z
+	c.lastChunkX = int(c.x) >> 4
+	c.lastChunkZ = int(c.z) >> 4
 
 	c.gamemode = 1
-	if err := sendLoginPlay(c.writer, c.eid, c.gamemode); err != nil {
+	if err := sendLoginPlay(c, c.eid, c.gamemode); err != nil {
 		return err
 	}
-	if err := sendPlayBrand(c.writer, "PiChunk"); err != nil {
+	if err := sendPlayBrand(c, "PiChunk"); err != nil {
 		return err
 	}
-	if err := sendSetDefaultSpawn(c.writer); err != nil {
+	if err := sendSetDefaultSpawn(c); err != nil {
 		return err
 	}
-	if err := sendGameEvent(c.writer, 13, 0); err != nil {
+	if err := sendGameEvent(c, 13, 0); err != nil {
 		return err
 	}
-	if err := sendPlayerInfoAdd(c.writer, c.uuid, c.username, c.eid, 1); err != nil {
+	if err := sendPlayerInfoAdd(c, c.uuid, c.username, c.eid, 1); err != nil {
 		return err
 	}
 	tid := c.teleportID.Add(1)
-	if err := sendSyncPosition(c.writer, tid, c.x, c.y, c.z, c.yaw, c.pitch); err != nil {
+	if err := sendSyncPosition(c, tid, c.x, c.y, c.z, c.yaw, c.pitch); err != nil {
 		return err
 	}
-	c.server.world.mu.RLock()
-	for _, chunk := range c.server.world.chunks {
-		if err := sendChunkData(c.writer, chunk); err != nil {
-			c.server.world.mu.RUnlock()
-			return err
-		}
-	}
-	c.server.world.mu.RUnlock()
+	_ = sendUpdateTime(c, c.server.worldAge.Load(), c.server.worldTime.Load(), true)
+
+	c.updateVisibleChunks()
+
 	if err := c.writer.Flush(); err != nil {
 		return err
 	}
@@ -243,9 +270,69 @@ func (c *Client) handlePlay() error {
 	return c.playLoop()
 }
 
+func (c *Client) updateVisibleChunks() {
+	chunkX := int(c.x) >> 4
+	chunkZ := int(c.z) >> 4
+	vd := serverConfig.ViewDistance
+	if vd <= 0 {
+		vd = 4
+	}
+
+	var toLoad []*Chunk
+	c.server.world.mu.RLock()
+	for dx := -vd; dx <= vd; dx++ {
+		for dz := -vd; dz <= vd; dz++ {
+			cx := chunkX + dx
+			cz := chunkZ + dz
+			key := getChunkKey(cx, cz)
+			if chunk, ok := c.server.world.chunks[key]; ok {
+				c.loadedChunksMu.Lock()
+				if !c.loadedChunks[key] {
+					c.loadedChunks[key] = true
+					toLoad = append(toLoad, chunk)
+				}
+				c.loadedChunksMu.Unlock()
+			}
+		}
+	}
+	c.server.world.mu.RUnlock()
+
+	var toUnload [][2]int
+	c.loadedChunksMu.Lock()
+	for key := range c.loadedChunks {
+		cx := int(int32(key >> 32))
+		cz := int(int32(key))
+		dx := cx - chunkX
+		if dx < 0 {
+			dx = -dx
+		}
+		dz := cz - chunkZ
+		if dz < 0 {
+			dz = -dz
+		}
+		if dx > vd+1 || dz > vd+1 {
+			toUnload = append(toUnload, [2]int{cx, cz})
+			delete(c.loadedChunks, key)
+		}
+	}
+	c.loadedChunksMu.Unlock()
+
+	if len(toLoad) > 0 || len(toUnload) > 0 {
+		c.writeMu.Lock()
+		for _, u := range toUnload {
+			_ = sendUnloadChunk(c, u[0], u[1])
+		}
+		for _, ch := range toLoad {
+			_ = sendChunkData(c, ch)
+		}
+		_ = c.writer.Flush()
+		c.writeMu.Unlock()
+	}
+}
+
 func (c *Client) playLoop() error {
 	for {
-		id, data, err := readPacket(c.reader)
+		id, data, err := c.readPacket()
 		if err != nil {
 			return err
 		}
@@ -257,6 +344,15 @@ func (c *Client) playLoop() error {
 			dr := newDataReader(data)
 			kid, _ := dr.readInt64()
 			c.lastKeepalive.Store(kid)
+			sentTime := c.lastKeepaliveSent.Load()
+			if sentTime > 0 {
+				rtt := int32((time.Now().UnixNano() - sentTime) / int64(time.Millisecond))
+				if rtt < 0 {
+					rtt = 0
+				}
+				c.ping.Store(rtt)
+				c.server.BroadcastPlayerLatency(c.uuid, rtt)
+			}
 
 		case playSBPacketID_ChatMessage:
 			dr := newDataReader(data)
@@ -287,27 +383,6 @@ func (c *Client) playLoop() error {
 		case playSBPacketID_ChatCommand, playSBPacketID_ChatCommandSigned:
 			dr := newDataReader(data)
 			cmd, _ := dr.readString()
-			
-			if strings.HasPrefix(cmd, "gamemode ") {
-				modeStr := strings.TrimPrefix(cmd, "gamemode ")
-				var newMode byte = 255
-				switch modeStr {
-				case "0", "survival":
-					newMode = 0
-				case "1", "creative":
-					newMode = 1
-				case "2", "adventure":
-					newMode = 2
-				case "3", "spectator":
-					newMode = 3
-				}
-				if newMode != 255 {
-					c.gamemode = newMode
-					sendGameEvent(c.writer, 3, float32(newMode))
-					c.server.BroadcastSystemMessage(fmt.Sprintf("\u00a7e%s set their game mode to %s", c.username, modeStr))
-				}
-				continue
-			}
 			c.handleCommand(cmd)
 
 		case playSBPacketID_PlayerPos:
@@ -320,6 +395,13 @@ func (c *Client) playLoop() error {
 			c.x, c.y, c.z = x, y, z
 			c.onGround = og
 			c.server.BroadcastMove(c)
+			curChunkX := int(c.x) >> 4
+			curChunkZ := int(c.z) >> 4
+			if curChunkX != c.lastChunkX || curChunkZ != c.lastChunkZ {
+				c.lastChunkX = curChunkX
+				c.lastChunkZ = curChunkZ
+				c.updateVisibleChunks()
+			}
 
 		case playSBPacketID_PlayerPosRot:
 			dr := newDataReader(data)
@@ -334,6 +416,13 @@ func (c *Client) playLoop() error {
 			c.yaw, c.pitch = yaw, pitch
 			c.onGround = og
 			c.server.BroadcastMove(c)
+			curChunkX := int(c.x) >> 4
+			curChunkZ := int(c.z) >> 4
+			if curChunkX != c.lastChunkX || curChunkZ != c.lastChunkZ {
+				c.lastChunkX = curChunkX
+				c.lastChunkZ = curChunkZ
+				c.updateVisibleChunks()
+			}
 
 		case playSBPacketID_PlayerRot:
 			dr := newDataReader(data)
@@ -388,9 +477,11 @@ func (c *Client) playLoop() error {
 			_, _ = dr.readUint8()
 			if status == 0 || status == 2 {
 				x, y, z := decodePosition(posVal)
-				if c.server.world.GetBlock(x, y, z) != stateAir {
+				oldBlock := c.server.world.GetBlock(x, y, z)
+				if oldBlock != stateAir {
 					c.server.world.SetBlock(x, y, z, stateAir)
 					c.server.BroadcastBlockUpdate(x, y, z, stateAir)
+					c.server.BroadcastWorldEvent(2001, x, y, z, int32(oldBlock))
 				}
 			}
 
@@ -406,6 +497,30 @@ func (c *Client) playLoop() error {
 			_, _ = dr.readVarInt()
 
 			bx, by, bz := decodePosition(posVal)
+
+			// 1. Check if clicking an interactive block (door, trapdoor, fence gate, lever, button)
+			clickedBlock := c.server.world.GetBlock(bx, by, bz)
+			if toggledState, ok, soundEvent, isDoor := ToggleInteractableBlock(clickedBlock); ok {
+				c.server.world.SetBlock(bx, by, bz, toggledState)
+				c.server.BroadcastBlockUpdate(bx, by, bz, toggledState)
+				if soundEvent > 0 {
+					c.server.BroadcastWorldEvent(soundEvent, bx, by, bz, 0)
+				}
+				if isDoor {
+					// Check other half of door
+					for _, dy := range []int{-1, 1} {
+						otherY := by + dy
+						otherBlock := c.server.world.GetBlock(bx, otherY, bz)
+						if otherToggled, otherOk, _, _ := ToggleInteractableBlock(otherBlock); otherOk {
+							c.server.world.SetBlock(bx, otherY, bz, otherToggled)
+							c.server.BroadcastBlockUpdate(bx, otherY, bz, otherToggled)
+						}
+					}
+				}
+				continue
+			}
+
+			// 2. Placing block
 			nx, ny, nz := bx, by, bz
 			switch face {
 			case 0:
@@ -422,8 +537,7 @@ func (c *Client) playLoop() error {
 				nx++
 			}
 
-			if nx >= 0 && nx < 16 && nz >= 0 && nz < 16 &&
-				ny >= worldMinY && ny < worldMinY+worldHeight {
+			if ny >= worldMinY && ny < worldMinY+worldHeight && c.server.world.GetChunk(nx>>4, nz>>4) != nil {
 				invSlot := 36 + int(c.heldSlot)
 				if hand == 1 {
 					invSlot = 45
@@ -436,6 +550,16 @@ func (c *Client) playLoop() error {
 				if stateID == 0 {
 					stateID = stateDirt
 				}
+
+				// Check if placing a slab on an existing bottom slab -> turn into double slab
+				if isSlabState(stateID) && clickedBlock == stateID && face == 1 {
+					doubleState := stateID + 2
+					c.server.world.SetBlock(bx, by, bz, doubleState)
+					c.server.BroadcastBlockUpdate(bx, by, bz, doubleState)
+					continue
+				}
+
+				stateID = AdjustPlacedBlockState(stateID, face, c.yaw)
 
 				if c.server.world.GetBlock(nx, ny, nz) == stateAir {
 					c.server.world.SetBlock(nx, ny, nz, stateID)
@@ -572,13 +696,227 @@ func offlineUUID(name string) [16]byte {
 	return h
 }
 
+func (c *Client) sendSystemMessage(msg string) {
+	c.writeMu.Lock()
+	_ = sendSystemChat(c, msg)
+	_ = c.writer.Flush()
+	c.writeMu.Unlock()
+}
+
+func (c *Client) teleportTo(x, y, z float64, yaw, pitch float32) {
+	c.x, c.y, c.z = x, y, z
+	c.yaw, c.pitch = yaw, pitch
+	c.lastX, c.lastY, c.lastZ = x, y, z
+	tid := c.teleportID.Add(1)
+	c.writeMu.Lock()
+	_ = sendSyncPosition(c, tid, x, y, z, yaw, pitch)
+	_ = c.writer.Flush()
+	c.writeMu.Unlock()
+	c.server.BroadcastMove(c)
+	c.updateVisibleChunks()
+}
+
 func (c *Client) handleCommand(cmdStr string) {
 	parts := strings.Fields(cmdStr)
 	if len(parts) == 0 {
 		return
 	}
 	cmd := strings.ToLower(parts[0])
-	if cmd == "block" || cmd == "/block" {
+
+	switch cmd {
+	case "help", "/help":
+		c.sendSystemMessage("\u00a76--- PiChunk Commands ---")
+		c.sendSystemMessage("\u00a7e/gamemode <0|1|2|3> [player] \u00a77- Change gamemode")
+		c.sendSystemMessage("\u00a7e/tp <target> or /tp <x> <y> <z> \u00a77- Teleport")
+		c.sendSystemMessage("\u00a7e/time <set|add> <day|night|ticks> \u00a77- Change time")
+		c.sendSystemMessage("\u00a7e/weather <clear|rain> \u00a77- Change weather")
+		c.sendSystemMessage("\u00a7e/kick <player> [reason] \u00a77- Kick player")
+		c.sendSystemMessage("\u00a7e/clear [player] \u00a77- Clear inventory")
+		c.sendSystemMessage("\u00a7e/list \u00a77- List online players")
+		c.sendSystemMessage("\u00a7e/save \u00a77- Save world to disk")
+		c.sendSystemMessage("\u00a7e/block <name|id> \u00a77- Set held block")
+		c.sendSystemMessage("\u00a7e/setblock <x> <y> <z> <name|id> \u00a77- Set block in world")
+		return
+
+	case "list", "/list":
+		names := c.server.GetPlayerNames()
+		c.sendSystemMessage(fmt.Sprintf("\u00a76There are %d/%d players online: \u00a7a%s",
+			len(names), serverConfig.MaxPlayers, strings.Join(names, ", ")))
+		return
+
+	case "time", "/time":
+		if len(parts) >= 3 {
+			sub := strings.ToLower(parts[1])
+			valStr := strings.ToLower(parts[2])
+			if sub == "set" {
+				var newTime int64
+				switch valStr {
+				case "day":
+					newTime = 1000
+				case "noon":
+					newTime = 6000
+				case "sunset":
+					newTime = 12000
+				case "night":
+					newTime = 13000
+				case "midnight":
+					newTime = 18000
+				case "sunrise":
+					newTime = 23000
+				default:
+					if v, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+						newTime = v % 24000
+					}
+				}
+				c.server.worldTime.Store(newTime)
+				c.server.BroadcastTime()
+				c.server.BroadcastSystemMessage(fmt.Sprintf("\u00a7eSet the time to %d", newTime))
+				return
+			} else if sub == "add" {
+				if v, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+					newTime := (c.server.worldTime.Load() + v) % 24000
+					c.server.worldTime.Store(newTime)
+					c.server.BroadcastTime()
+					c.server.BroadcastSystemMessage(fmt.Sprintf("\u00a7eAdded %d to the time", v))
+					return
+				}
+			}
+		}
+		c.sendSystemMessage("\u00a7cUsage: /time <set|add> <value>")
+		return
+
+	case "weather", "/weather":
+		if len(parts) >= 2 {
+			sub := strings.ToLower(parts[1])
+			if sub == "clear" || sub == "sun" {
+				c.server.BroadcastWeather(false)
+				c.server.BroadcastSystemMessage("\u00a7eSet the weather to clear")
+				return
+			} else if sub == "rain" || sub == "thunder" {
+				c.server.BroadcastWeather(true)
+				c.server.BroadcastSystemMessage("\u00a7eSet the weather to rain")
+				return
+			}
+		}
+		c.sendSystemMessage("\u00a7cUsage: /weather <clear|rain>")
+		return
+
+	case "tp", "/tp", "teleport", "/teleport":
+		if len(parts) == 2 {
+			target := c.server.FindClientByName(parts[1])
+			if target == nil {
+				c.sendSystemMessage(fmt.Sprintf("\u00a7cPlayer %s not found", parts[1]))
+				return
+			}
+			c.teleportTo(target.x, target.y, target.z, target.yaw, target.pitch)
+			c.sendSystemMessage(fmt.Sprintf("\u00a7eTeleported to %s", target.username))
+			return
+		} else if len(parts) == 3 {
+			src := c.server.FindClientByName(parts[1])
+			target := c.server.FindClientByName(parts[2])
+			if src == nil || target == nil {
+				c.sendSystemMessage("\u00a7cOne or more players not found")
+				return
+			}
+			src.teleportTo(target.x, target.y, target.z, target.yaw, target.pitch)
+			c.server.BroadcastSystemMessage(fmt.Sprintf("\u00a7eTeleported %s to %s", src.username, target.username))
+			return
+		} else if len(parts) >= 4 {
+			var x, y, z float64
+			_, errX := fmt.Sscanf(parts[1], "%f", &x)
+			_, errY := fmt.Sscanf(parts[2], "%f", &y)
+			_, errZ := fmt.Sscanf(parts[3], "%f", &z)
+			if errX == nil && errY == nil && errZ == nil {
+				c.teleportTo(x, y, z, c.yaw, c.pitch)
+				c.sendSystemMessage(fmt.Sprintf("\u00a7eTeleported to %.1f, %.1f, %.1f", x, y, z))
+				return
+			}
+		}
+		c.sendSystemMessage("\u00a7cUsage: /tp <target> or /tp <x> <y> <z>")
+		return
+
+	case "kick", "/kick":
+		if len(parts) >= 2 {
+			target := c.server.FindClientByName(parts[1])
+			if target == nil {
+				c.sendSystemMessage(fmt.Sprintf("\u00a7cPlayer %s not found", parts[1]))
+				return
+			}
+			reason := "Kicked by an operator"
+			if len(parts) > 2 {
+				reason = strings.Join(parts[2:], " ")
+			}
+			target.writeMu.Lock()
+			_ = sendKickDisconnect(target, reason)
+			_ = target.writer.Flush()
+			target.writeMu.Unlock()
+			target.conn.Close()
+			c.server.BroadcastSystemMessage(fmt.Sprintf("\u00a7eKicked %s: %s", target.username, reason))
+			return
+		}
+		c.sendSystemMessage("\u00a7cUsage: /kick <player> [reason]")
+		return
+
+	case "clear", "/clear":
+		target := c
+		if len(parts) >= 2 {
+			target = c.server.FindClientByName(parts[1])
+			if target == nil {
+				c.sendSystemMessage(fmt.Sprintf("\u00a7cPlayer %s not found", parts[1]))
+				return
+			}
+		}
+		for i := range target.inventory {
+			target.inventory[i] = 0
+		}
+		c.server.BroadcastEquipment(target)
+		c.server.BroadcastSystemMessage(fmt.Sprintf("\u00a7eCleared the inventory of %s", target.username))
+		return
+
+	case "save", "/save":
+		if err := c.server.world.Save("world.bin"); err != nil {
+			c.sendSystemMessage(fmt.Sprintf("\u00a7cFailed to save world: %v", err))
+		} else {
+			c.server.BroadcastSystemMessage("\u00a7aWorld saved successfully.")
+		}
+		return
+
+	case "gamemode", "/gamemode":
+		if len(parts) >= 2 {
+			modeStr := strings.ToLower(parts[1])
+			var newMode byte = 255
+			switch modeStr {
+			case "0", "survival", "s":
+				newMode = 0
+			case "1", "creative", "c":
+				newMode = 1
+			case "2", "adventure", "a":
+				newMode = 2
+			case "3", "spectator", "sp":
+				newMode = 3
+			}
+			if newMode != 255 {
+				target := c
+				if len(parts) >= 3 {
+					target = c.server.FindClientByName(parts[2])
+					if target == nil {
+						c.sendSystemMessage(fmt.Sprintf("\u00a7cPlayer %s not found", parts[2]))
+						return
+					}
+				}
+				target.gamemode = newMode
+				target.writeMu.Lock()
+				_ = sendGameEvent(target, 3, float32(newMode))
+				_ = target.writer.Flush()
+				target.writeMu.Unlock()
+				c.server.BroadcastSystemMessage(fmt.Sprintf("\u00a7eSet %s's game mode to %s", target.username, modeStr))
+				return
+			}
+		}
+		c.sendSystemMessage("\u00a7cUsage: /gamemode <survival|creative|adventure|spectator> [player]")
+		return
+
+	case "block", "/block":
 		if len(parts) >= 2 {
 			target := parts[1]
 			st, ok := GetBlockStateByName(target)
@@ -593,11 +931,15 @@ func (c *Client) handleCommand(cmdStr string) {
 			if ok {
 				invSlot := 36 + int(c.heldSlot)
 				c.inventory[invSlot] = int32(st)
-				c.server.BroadcastChat("Server", fmt.Sprintf("%s set held block to state %d", c.username, st))
+				c.server.BroadcastEquipment(c)
+				c.sendSystemMessage(fmt.Sprintf("\u00a7eSet held block to %s (state %d)", target, st))
 				return
 			}
+			c.sendSystemMessage(fmt.Sprintf("\u00a7cUnknown block: %s", target))
+			return
 		}
-	} else if cmd == "setblock" || cmd == "/setblock" {
+
+	case "setblock", "/setblock":
 		if len(parts) >= 5 {
 			var x, y, z int
 			_, errX := fmt.Sscanf(parts[1], "%d", &x)
@@ -622,5 +964,6 @@ func (c *Client) handleCommand(cmdStr string) {
 			}
 		}
 	}
+
 	c.server.BroadcastChat(c.username, "/"+cmdStr)
 }

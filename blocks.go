@@ -1,5 +1,7 @@
 package main
 
+import "math"
+
 var ItemToBlockState = [1385]uint32{
 	1:    1,
 	2:    2,
@@ -2061,4 +2063,226 @@ func GetBlockStateFromItem(itemID int32) uint32 {
 func GetBlockStateByName(name string) (uint32, bool) {
 	st, ok := BlockNameToState[name]
 	return st, ok
+}
+
+var interactableRanges = [...]struct {
+	min, max, delta uint32
+	kind            byte // 1: door, 2: trapdoor, 3: gate, 4: lever/button
+}{
+	{4677, 4740, 2, 1},   // oak_door
+	{5793, 5816, 1, 4},   // lever
+	{5819, 5882, 2, 1},   // iron_door
+	{5917, 5940, 1, 4},   // stone_button
+	{6130, 6193, 4, 2},   // oak_trapdoor
+	{6194, 6257, 4, 2},   // spruce_trapdoor
+	{6258, 6321, 4, 2},   // birch_trapdoor
+	{6322, 6385, 4, 2},   // jungle_trapdoor
+	{6386, 6449, 4, 2},   // acacia_trapdoor
+	{6450, 6513, 4, 2},   // cherry_trapdoor
+	{6514, 6577, 4, 2},   // dark_oak_trapdoor
+	{6578, 6641, 4, 2},   // pale_oak_trapdoor
+	{6642, 6705, 4, 2},   // mangrove_trapdoor
+	{6706, 6769, 4, 2},   // bamboo_trapdoor
+	{7358, 7389, 2, 3},   // oak_fence_gate
+	{9386, 9409, 1, 4},   // oak_button
+	{9410, 9433, 1, 4},   // spruce_button
+	{9434, 9457, 1, 4},   // birch_button
+	{9458, 9481, 1, 4},   // jungle_button
+	{9482, 9505, 1, 4},   // acacia_button
+	{9506, 9529, 1, 4},   // cherry_button
+	{9530, 9553, 1, 4},   // dark_oak_button
+	{9554, 9577, 1, 4},   // pale_oak_button
+	{9578, 9601, 1, 4},   // mangrove_button
+	{9602, 9625, 1, 4},   // bamboo_button
+	{11278, 11341, 4, 2}, // iron_trapdoor
+	{12195, 12226, 2, 3}, // spruce_fence_gate
+	{12227, 12258, 2, 3}, // birch_fence_gate
+	{12259, 12290, 2, 3}, // jungle_fence_gate
+	{12291, 12322, 2, 3}, // acacia_fence_gate
+	{12323, 12354, 2, 3}, // cherry_fence_gate
+	{12355, 12386, 2, 3}, // dark_oak_fence_gate
+	{12387, 12418, 2, 3}, // pale_oak_fence_gate
+	{12419, 12450, 2, 3}, // mangrove_fence_gate
+	{12451, 12482, 2, 3}, // bamboo_fence_gate
+	{12771, 12834, 2, 1}, // spruce_door
+	{12835, 12898, 2, 1}, // birch_door
+	{12899, 12962, 2, 1}, // jungle_door
+	{12963, 13026, 2, 1}, // acacia_door
+	{13027, 13090, 2, 1}, // cherry_door
+	{13091, 13154, 2, 1}, // dark_oak_door
+	{13155, 13218, 2, 1}, // pale_oak_door
+	{13219, 13282, 2, 1}, // mangrove_door
+	{13283, 13346, 2, 1}, // bamboo_door
+	{19761, 19824, 4, 2}, // crimson_trapdoor
+	{19825, 19888, 4, 2}, // warped_trapdoor
+	{19889, 19920, 2, 3}, // crimson_fence_gate
+	{19921, 19952, 2, 3}, // warped_fence_gate
+	{20113, 20136, 1, 4}, // crimson_button
+	{20137, 20160, 1, 4}, // warped_button
+	{20161, 20224, 2, 1}, // crimson_door
+	{20225, 20288, 2, 1}, // warped_door
+	{21387, 21410, 1, 4}, // polished_blackstone_button
+	{24665, 24728, 2, 1}, // copper_door
+	{24729, 24792, 2, 1}, // exposed_copper_door
+	{24793, 24856, 2, 1}, // oxidized_copper_door
+	{24857, 24920, 2, 1}, // weathered_copper_door
+	{24921, 24984, 2, 1}, // waxed_copper_door
+	{24985, 25048, 2, 1}, // waxed_exposed_copper_door
+	{25049, 25112, 2, 1}, // waxed_oxidized_copper_door
+	{25113, 25176, 2, 1}, // waxed_weathered_copper_door
+	{25177, 25240, 4, 2}, // copper_trapdoor
+	{25241, 25304, 4, 2}, // exposed_copper_trapdoor
+	{25305, 25368, 4, 2}, // oxidized_copper_trapdoor
+	{25369, 25432, 4, 2}, // weathered_copper_trapdoor
+	{25433, 25496, 4, 2}, // waxed_copper_trapdoor
+	{25497, 25560, 4, 2}, // waxed_exposed_copper_trapdoor
+	{25561, 25624, 4, 2}, // waxed_oxidized_copper_trapdoor
+	{25625, 25688, 4, 2}, // waxed_weathered_copper_trapdoor
+}
+
+func ToggleInteractableBlock(stateID uint32) (newStateID uint32, ok bool, soundEvent int32, isDoor bool) {
+	for i := range interactableRanges {
+		r := &interactableRanges[i]
+		if stateID >= r.min && stateID <= r.max {
+			newStateID = ((stateID - r.min) ^ r.delta) + r.min
+			isNowOpen := ((newStateID - r.min) & r.delta) == 0
+
+			switch r.kind {
+			case 1: // door
+				isDoor = true
+				if isNowOpen {
+					soundEvent = 1006 // open door
+				} else {
+					soundEvent = 1008 // close door
+				}
+			case 2: // trapdoor
+				if isNowOpen {
+					soundEvent = 1007 // open trapdoor
+				} else {
+					soundEvent = 1009 // close trapdoor
+				}
+			case 3: // fence gate
+				if isNowOpen {
+					soundEvent = 1014 // open fence gate
+				} else {
+					soundEvent = 1015 // close fence gate
+				}
+			case 4: // lever / button
+				soundEvent = 1000 // click
+			}
+			return newStateID, true, soundEvent, isDoor
+		}
+	}
+	return stateID, false, 0, false
+}
+
+func AdjustPlacedBlockState(baseState uint32, face int32, playerYaw float32) uint32 {
+	// Standing torch placed on a wall
+	if baseState == 2398 && face >= 2 && face <= 5 {
+		return 2399 + uint32(face-2)
+	}
+
+	// Logs / Wood / Pillars (axis: x=min+0, y=min+1, z=min+2)
+	// Base state in ItemToBlockState is y (min+1)
+	if baseState >= 137 && baseState <= 26000 {
+		// Quick check if baseState is a log (min+1)
+		if isLogState(baseState) {
+			switch face {
+			case 0, 1: // Y axis
+				return baseState
+			case 2, 3: // Z axis
+				return baseState + 1
+			case 4, 5: // X axis
+				return baseState - 1
+			}
+		}
+	}
+
+	// Slabs (type: top=min+0, bottom=min+2, double=min+4)
+	// Base state in ItemToBlockState is bottom (min+2)
+	if isSlabState(baseState) {
+		if face == 0 { // Clicked bottom face of a block -> place top slab
+			return baseState - 2
+		}
+		return baseState
+	}
+
+	// Stairs (80 states per type: 4 facings * 2 halves * 10 shapes)
+	if stairsMin, ok := getStairsMin(baseState); ok {
+		// Player yaw to direction: 0=South, 1=West, 2=North, 3=East
+		rot := int(math.Floor(float64(playerYaw*4.0/360.0 + 0.5))) & 3
+		var fIdx uint32
+		switch rot {
+		case 0: // Facing South -> stairs face North (0)
+			fIdx = 0
+		case 1: // Facing West -> stairs face East (3)
+			fIdx = 3
+		case 2: // Facing North -> stairs face South (1)
+			fIdx = 1
+		case 3: // Facing East -> stairs face West (2)
+			fIdx = 2
+		}
+		halfOffset := uint32(10) // bottom half
+		if face == 0 {
+			halfOffset = 0 // top half
+		}
+		return stairsMin + fIdx*20 + halfOffset
+	}
+
+	return baseState
+}
+
+func isLogState(st uint32) bool {
+	// Logs have 3 states (x, y, z) where y is the default state
+	for _, min := range logMins {
+		if st == min+1 {
+			return true
+		}
+	}
+	return false
+}
+
+func isSlabState(st uint32) bool {
+	for _, min := range slabMins {
+		if st == min+2 {
+			return true
+		}
+	}
+	return false
+}
+
+func getStairsMin(st uint32) (uint32, bool) {
+	for _, min := range stairsMins {
+		if st >= min && st < min+80 {
+			return min, true
+		}
+	}
+	return 0, false
+}
+
+var logMins = [...]uint32{
+	136, 148, 160, 172, 184, 196, 208, 220, 232, 244,
+	256, 268, 280, 292, 304, 316, 328, 340, 352, 364,
+	376, 388, 400, 412, 424, 436, 448, 460, 472, 484,
+	496, 508, 520, 532, 544, 556, 568, 580, 592, 604,
+	616, 628, 640, 652, 664,
+}
+
+var slabMins = [...]uint32{
+	12041, 12047, 12053, 12059, 12065, 12071, 12077, 12083, 12089, 12095,
+	12101, 12107, 12113, 12119, 12125, 12131, 12137, 12143, 12149, 12155,
+	12161, 12167, 12173, 12179, 12185, 12191, 19574, 19580, 19586, 19592,
+	21360, 21366, 21372, 21378, 23900, 23906, 23912, 23918, 23924, 23930,
+	23936, 23942, 23948, 23954, 23960, 23966, 23972, 23978, 23984, 23990,
+	23996, 24002, 24008, 24014, 24020, 24026, 24032, 24038, 24044, 24050,
+	24056, 24062,
+}
+
+var stairsMins = [...]uint32{
+	2929, 3009, 4485, 4565, 5945, 6025, 6958, 7038, 7118, 7198,
+	7278, 9630, 9710, 9790, 9870, 9950, 10030, 10110, 10190, 10270,
+	10350, 10430, 10510, 10590, 10670, 10750, 10830, 10910, 10990, 11070,
+	11150, 11230, 19630, 19710, 21280, 21360, 23420, 23500, 23580, 23660,
+	23740, 23820, 24070, 24150, 24230, 24310, 24390, 24470, 24550, 24630,
+	24710, 24790, 24870, 24950, 25030, 25110, 25190, 25270,
 }

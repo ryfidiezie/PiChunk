@@ -532,7 +532,7 @@ func encodeBlockSection(sectionBlocks []uint32) []byte {
 }
 
 func (c *Chunk) buildChunkData() []byte {
-	var sectionData []byte
+	sectionData := make([]byte, 0, 4096)
 
 	for sec := 0; sec < numSections; sec++ {
 		s := c.sections[sec]
@@ -562,7 +562,7 @@ func (c *Chunk) buildChunkData() []byte {
 	worldSurface := computeHeightmap(c, false)
 	heightmapNBT := buildHeightmapNBT(motionBlocking, worldSurface)
 
-	var data []byte
+	data := make([]byte, 0, len(sectionData)+len(heightmapNBT)+300)
 	data = appendInt32BE(data, int32(c.x))
 	data = appendInt32BE(data, int32(c.z))
 	data = append(data, heightmapNBT...)

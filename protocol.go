@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"math/rand"
 )
 
 const (
 	loginPacketID_LoginSuccess = 0x02
+	loginPacketID_Compress     = 0x03
 	loginPacketID_Disconnect   = 0x00
 
 	configCBPacketID_CustomPayload = 0x01
@@ -24,9 +24,13 @@ const (
 	playPacketID_EntityAnimation  = 0x03
 	playPacketID_BlockUpdate      = 0x09
 	playPacketID_CustomPayload    = 0x19
+	playPacketID_KickDisconnect   = 0x1D
+	playPacketID_SyncEntityPos    = 0x20
+	playPacketID_UnloadChunk      = 0x22
 	playPacketID_GameEvent        = 0x23
 	playPacketID_KeepAlive        = 0x27
 	playPacketID_ChunkData        = 0x28
+	playPacketID_WorldEvent       = 0x29
 	playPacketID_LoginPlay        = 0x2C
 	playPacketID_EntityPosRot     = 0x30
 	playPacketID_EntityRot        = 0x32
@@ -38,6 +42,7 @@ const (
 	playPacketID_SetDefaultSpawn  = 0x5B
 	playPacketID_EntityMetadata   = 0x5D
 	playPacketID_EntityEquipment  = 0x60
+	playPacketID_UpdateTime       = 0x6B
 	playPacketID_SystemChat       = 0x73
 	playPacketID_EntityTeleport   = 0x77
 
@@ -57,59 +62,75 @@ const (
 	playSBPacketID_UseItemOn         = 0x3C
 )
 
-func sendLoginSuccess(bw *bufio.Writer, uuid [16]byte, name string) error {
+func sendLoginCompress(c *Client, threshold int32) error {
+	var p []byte
+	p = appendVarInt(p, threshold)
+	return sendPacket(c.writer, loginPacketID_Compress, p)
+}
+
+func sendLoginSuccess(c *Client, uuid [16]byte, name string) error {
 	var p []byte
 	p = append(p, uuid[:]...)
 	p = appendString(p, name)
 	p = appendVarInt(p, 0) // properties count
-	return sendPacket(bw, loginPacketID_LoginSuccess, p)
+	return c.sendPacket(loginPacketID_LoginSuccess, p)
 }
 
-func sendLoginDisconnect(bw *bufio.Writer, reason string) error {
+func sendLoginDisconnect(c *Client, reason string) error {
 	var p []byte
 	p = appendString(p, fmt.Sprintf(`{"text":%q}`, reason))
-	return sendPacket(bw, loginPacketID_Disconnect, p)
+	return c.sendPacket(loginPacketID_Disconnect, p)
 }
 
-func sendFeatureFlags(bw *bufio.Writer) error {
+func sendFeatureFlags(c *Client) error {
 	var p []byte
 	p = appendVarInt(p, 1)
 	p = appendString(p, "minecraft:vanilla")
-	return sendPacket(bw, configCBPacketID_FeatureFlags, p)
+	return c.sendPacket(configCBPacketID_FeatureFlags, p)
 }
 
-func sendKnownPacks(bw *bufio.Writer) error {
+func sendKnownPacks(c *Client) error {
 	var p []byte
 	p = appendVarInt(p, 1)
 	p = appendString(p, "minecraft")
 	p = appendString(p, "core")
 	p = appendString(p, "1.21.4")
-	return sendPacket(bw, configCBPacketID_KnownPacks, p)
+	return c.sendPacket(configCBPacketID_KnownPacks, p)
 }
 
-func sendFinishConfig(bw *bufio.Writer) error {
-	return sendPacket(bw, configCBPacketID_FinishConfig, nil)
+func sendFinishConfig(c *Client) error {
+	return c.sendPacket(configCBPacketID_FinishConfig, nil)
 }
 
-func sendRegistryPackets(bw *bufio.Writer) error {
+func sendRegistryPackets(c *Client) error {
 	for _, p := range registryPackets {
-		if err := writeVarInt(bw, int32(len(p))); err != nil {
-			return err
+		if len(p) == 0 {
+			continue
 		}
-		if _, err := bw.Write(p); err != nil {
-			return err
+		packetID := int32(p[0])
+		if c.compressionThreshold >= 0 {
+			if err := c.sendPacket(packetID, p[1:]); err != nil {
+				return err
+			}
+		} else {
+			if err := writeVarInt(c.writer, int32(len(p))); err != nil {
+				return err
+			}
+			if _, err := c.writer.Write(p); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func sendUpdateTags(bw *bufio.Writer) error {
+func sendUpdateTags(c *Client) error {
 	var p []byte
 	p = appendVarInt(p, 0)
-	return sendPacket(bw, configCBPacketID_UpdateTags, p)
+	return c.sendPacket(configCBPacketID_UpdateTags, p)
 }
 
-func sendLoginPlay(bw *bufio.Writer, eid int32, gamemode byte) error {
+func sendLoginPlay(c *Client, eid int32, gamemode byte) error {
 	var p []byte
 	p = appendInt32BE(p, eid)
 	p = appendBool(p, false)
@@ -134,15 +155,15 @@ func sendLoginPlay(bw *bufio.Writer, eid int32, gamemode byte) error {
 	p = appendVarInt(p, 63)
 
 	p = appendBool(p, false)
-	return sendPacket(bw, playPacketID_LoginPlay, p)
+	return c.sendPacket(playPacketID_LoginPlay, p)
 }
 
-func sendSetDefaultSpawn(bw *bufio.Writer) error {
+func sendSetDefaultSpawn(c *Client) error {
 	var p []byte
 	pos := encodePosition(8, 5, 8)
 	p = appendInt64BE(p, pos)
 	p = appendFloat32BE(p, 0)
-	return sendPacket(bw, playPacketID_SetDefaultSpawn, p)
+	return c.sendPacket(playPacketID_SetDefaultSpawn, p)
 }
 
 func encodePosition(x, y, z int) int64 {
@@ -165,18 +186,25 @@ func decodePosition(v int64) (x, y, z int) {
 	return
 }
 
-func sendChunkData(bw *bufio.Writer, chunk *Chunk) error {
-	return sendPacket(bw, playPacketID_ChunkData, chunk.ChunkData())
+func sendChunkData(c *Client, chunk *Chunk) error {
+	return c.sendPacket(playPacketID_ChunkData, chunk.ChunkData())
 }
 
-func sendGameEvent(bw *bufio.Writer, event byte, value float32) error {
+func sendUnloadChunk(c *Client, chunkX, chunkZ int) error {
+	var p []byte
+	p = appendInt32BE(p, int32(chunkZ))
+	p = appendInt32BE(p, int32(chunkX))
+	return c.sendPacket(playPacketID_UnloadChunk, p)
+}
+
+func sendGameEvent(c *Client, event byte, value float32) error {
 	var p []byte
 	p = append(p, event)
 	p = appendFloat32BE(p, value)
-	return sendPacket(bw, playPacketID_GameEvent, p)
+	return c.sendPacket(playPacketID_GameEvent, p)
 }
 
-func sendSyncPosition(bw *bufio.Writer, teleportID int32, x, y, z float64, yaw, pitch float32) error {
+func sendSyncPosition(c *Client, teleportID int32, x, y, z float64, yaw, pitch float32) error {
 	var p []byte
 	p = appendVarInt(p, teleportID)
 	p = appendFloat64BE(p, x)
@@ -188,27 +216,44 @@ func sendSyncPosition(bw *bufio.Writer, teleportID int32, x, y, z float64, yaw, 
 	p = appendFloat32BE(p, yaw)
 	p = appendFloat32BE(p, pitch)
 	p = appendUint32BE(p, 0)
-	return sendPacket(bw, playPacketID_SyncPos, p)
+	return c.sendPacket(playPacketID_SyncPos, p)
 }
 
-func sendKeepAlive(bw *bufio.Writer, id int64) error {
+func sendKeepAlive(c *Client, id int64) error {
 	var p []byte
 	p = appendInt64BE(p, id)
-	return sendPacket(bw, playPacketID_KeepAlive, p)
+	return c.sendPacket(playPacketID_KeepAlive, p)
 }
 
 func newKeepAliveID() int64 {
 	return rand.Int63()
 }
 
-func sendBlockUpdate(bw *bufio.Writer, x, y, z int, stateID uint32) error {
+func sendBlockUpdate(c *Client, x, y, z int, stateID uint32) error {
 	var p []byte
 	p = appendInt64BE(p, encodePosition(x, y, z))
 	p = appendVarInt(p, int32(stateID))
-	return sendPacket(bw, playPacketID_BlockUpdate, p)
+	return c.sendPacket(playPacketID_BlockUpdate, p)
 }
 
-func sendPlayerInfoAdd(bw *bufio.Writer, uuid [16]byte, name string, _ int32, _ int32) error {
+func sendWorldEvent(c *Client, effectID int32, x, y, z int, data int32, global bool) error {
+	var p []byte
+	p = appendInt32BE(p, effectID)
+	p = appendInt64BE(p, encodePosition(x, y, z))
+	p = appendInt32BE(p, data)
+	p = appendBool(p, global)
+	return c.sendPacket(playPacketID_WorldEvent, p)
+}
+
+func sendUpdateTime(c *Client, age int64, timeOfDay int64, tickDayTime bool) error {
+	var p []byte
+	p = appendInt64BE(p, age)
+	p = appendInt64BE(p, timeOfDay)
+	p = appendBool(p, tickDayTime)
+	return c.sendPacket(playPacketID_UpdateTime, p)
+}
+
+func sendPlayerInfoAdd(c *Client, uuid [16]byte, name string, _ int32, _ int32) error {
 	var p []byte
 	p = appendByte(p, 0x0D)
 	p = appendVarInt(p, 1)
@@ -217,17 +262,32 @@ func sendPlayerInfoAdd(bw *bufio.Writer, uuid [16]byte, name string, _ int32, _ 
 	p = appendVarInt(p, 0)
 	p = appendVarInt(p, 1)
 	p = appendVarInt(p, 1)
-	return sendPacket(bw, playPacketID_PlayerInfoUpdate, p)
+	return c.sendPacket(playPacketID_PlayerInfoUpdate, p)
 }
 
-func sendPlayerInfoRemove(bw *bufio.Writer, uuid [16]byte) error {
+func sendPlayerLatency(c *Client, uuid [16]byte, latency int32) error {
+	var p []byte
+	p = appendByte(p, 0x10) // action: update_latency (bit 4)
+	p = appendVarInt(p, 1)  // 1 player
+	p = append(p, uuid[:]...)
+	p = appendVarInt(p, latency)
+	return c.sendPacket(playPacketID_PlayerInfoUpdate, p)
+}
+
+func sendPlayerInfoRemove(c *Client, uuid [16]byte) error {
 	var p []byte
 	p = appendVarInt(p, 1)
 	p = append(p, uuid[:]...)
-	return sendPacket(bw, playPacketID_PlayerInfoRemove, p)
+	return c.sendPacket(playPacketID_PlayerInfoRemove, p)
 }
 
-func sendSpawnEntity(bw *bufio.Writer, eid int32, uuid [16]byte, entityType int32, x, y, z float64, pitch, yaw, headYaw float32) error {
+func sendKickDisconnect(c *Client, reason string) error {
+	var p []byte
+	p = append(p, buildChatNBT(reason)...)
+	return c.sendPacket(playPacketID_KickDisconnect, p)
+}
+
+func sendSpawnEntity(c *Client, eid int32, uuid [16]byte, entityType int32, x, y, z float64, pitch, yaw, headYaw float32) error {
 	var p []byte
 	p = appendVarInt(p, eid)
 	p = append(p, uuid[:]...)
@@ -242,18 +302,14 @@ func sendSpawnEntity(bw *bufio.Writer, eid int32, uuid [16]byte, entityType int3
 	p = appendInt16BE(p, 0)
 	p = appendInt16BE(p, 0)
 	p = appendInt16BE(p, 0)
-	return sendPacket(bw, playPacketID_SpawnEntity, p)
-}
-
-func appendInt16BE(buf []byte, v int16) []byte {
-	return append(buf, byte(v>>8), byte(v))
+	return c.sendPacket(playPacketID_SpawnEntity, p)
 }
 
 func angleFromDeg(deg float32) byte {
 	return byte(int(deg/360.0*256) & 0xFF)
 }
 
-func sendEntityPosRot(bw *bufio.Writer, eid int32, dx, dy, dz float64, yaw, pitch float32, onGround bool) error {
+func sendEntityPosRot(c *Client, eid int32, dx, dy, dz float64, yaw, pitch float32, onGround bool) error {
 	var p []byte
 	p = appendVarInt(p, eid)
 	p = appendInt16BE(p, int16(dx*4096))
@@ -262,17 +318,17 @@ func sendEntityPosRot(bw *bufio.Writer, eid int32, dx, dy, dz float64, yaw, pitc
 	p = append(p, angleFromDeg(yaw))
 	p = append(p, angleFromDeg(pitch))
 	p = appendBool(p, onGround)
-	return sendPacket(bw, playPacketID_EntityPosRot, p)
+	return c.sendPacket(playPacketID_EntityPosRot, p)
 }
 
-func sendEntityHeadLook(bw *bufio.Writer, eid int32, headYaw float32) error {
+func sendEntityHeadLook(c *Client, eid int32, headYaw float32) error {
 	var p []byte
 	p = appendVarInt(p, eid)
 	p = append(p, angleFromDeg(headYaw))
-	return sendPacket(bw, playPacketID_EntityHeadLook, p)
+	return c.sendPacket(playPacketID_EntityHeadLook, p)
 }
 
-func sendSyncEntityPosition(bw *bufio.Writer, eid int32, x, y, z float64, yaw, pitch float32, onGround bool) error {
+func sendSyncEntityPosition(c *Client, eid int32, x, y, z float64, yaw, pitch float32, onGround bool) error {
 	var p []byte
 	p = appendVarInt(p, eid)
 	p = appendFloat64BE(p, x)
@@ -284,33 +340,33 @@ func sendSyncEntityPosition(bw *bufio.Writer, eid int32, x, y, z float64, yaw, p
 	p = appendFloat32BE(p, yaw)
 	p = appendFloat32BE(p, pitch)
 	p = appendBool(p, onGround)
-	return sendPacket(bw, 0x20, p)
+	return c.sendPacket(playPacketID_SyncEntityPos, p)
 }
 
-func sendRemoveEntities(bw *bufio.Writer, eids []int32) error {
+func sendRemoveEntities(c *Client, eids []int32) error {
 	var p []byte
 	p = appendVarInt(p, int32(len(eids)))
 	for _, eid := range eids {
 		p = appendVarInt(p, eid)
 	}
-	return sendPacket(bw, playPacketID_RemoveEntities, p)
+	return c.sendPacket(playPacketID_RemoveEntities, p)
 }
 
-func sendSystemChat(bw *bufio.Writer, msg string) error {
+func sendSystemChat(c *Client, msg string) error {
 	var p []byte
 	p = append(p, buildChatNBT(msg)...)
 	p = appendBool(p, false)
-	return sendPacket(bw, playPacketID_SystemChat, p)
+	return c.sendPacket(playPacketID_SystemChat, p)
 }
 
-func sendEntityAnimation(bw *bufio.Writer, eid int32, animation byte) error {
+func sendEntityAnimation(c *Client, eid int32, animation byte) error {
 	var p []byte
 	p = appendVarInt(p, eid)
 	p = appendByte(p, animation)
-	return sendPacket(bw, playPacketID_EntityAnimation, p)
+	return c.sendPacket(playPacketID_EntityAnimation, p)
 }
 
-func sendEntityEquipment(bw *bufio.Writer, eid int32, slot byte, itemID int32) error {
+func sendEntityEquipment(c *Client, eid int32, slot byte, itemID int32) error {
 	var p []byte
 	p = appendVarInt(p, eid)
 	p = appendByte(p, slot) // last item indicator, so no 0x80 flag
@@ -322,38 +378,38 @@ func sendEntityEquipment(bw *bufio.Writer, eid int32, slot byte, itemID int32) e
 		p = appendVarInt(p, 0) // addedComponentCount = 0
 		p = appendVarInt(p, 0) // removedComponentCount = 0
 	}
-	return sendPacket(bw, playPacketID_EntityEquipment, p)
+	return c.sendPacket(playPacketID_EntityEquipment, p)
 }
 
-func sendEntityMetadata(bw *bufio.Writer, eid int32, flags byte, pose int32) error {
+func sendEntityMetadata(c *Client, eid int32, flags byte, pose int32) error {
 	var p []byte
 	p = appendVarInt(p, eid)
-	
+
 	// Index 0: Byte (Type 0)
 	p = appendByte(p, 0)
 	p = appendVarInt(p, 0)
 	p = appendByte(p, flags)
-	
+
 	// Index 6: Pose (Type 21 in 1.21.4)
 	p = appendByte(p, 6)
 	p = appendVarInt(p, 21)
 	p = appendVarInt(p, pose)
-	
+
 	p = appendByte(p, 0xFF)
-	
-	return sendPacket(bw, playPacketID_EntityMetadata, p)
+
+	return c.sendPacket(playPacketID_EntityMetadata, p)
 }
 
-func sendConfigBrand(bw *bufio.Writer, brand string) error {
+func sendConfigBrand(c *Client, brand string) error {
 	var p []byte
 	p = appendString(p, "minecraft:brand")
 	p = appendString(p, brand)
-	return sendPacket(bw, configCBPacketID_CustomPayload, p)
+	return c.sendPacket(configCBPacketID_CustomPayload, p)
 }
 
-func sendPlayBrand(bw *bufio.Writer, brand string) error {
+func sendPlayBrand(c *Client, brand string) error {
 	var p []byte
 	p = appendString(p, "minecraft:brand")
 	p = appendString(p, brand)
-	return sendPacket(bw, playPacketID_CustomPayload, p)
+	return c.sendPacket(playPacketID_CustomPayload, p)
 }

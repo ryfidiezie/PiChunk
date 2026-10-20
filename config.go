@@ -9,10 +9,11 @@ import (
 )
 
 type Config struct {
-	ServerName   string
-	MaxPlayers   int
-	ViewDistance int
-	Chunks       int
+	ServerName           string
+	MaxPlayers           int
+	ViewDistance         int
+	Chunks               int
+	CompressionThreshold int
 }
 
 var serverConfig Config
@@ -20,10 +21,11 @@ var serverConfig Config
 func loadConfig() {
 	// Defaults
 	serverConfig = Config{
-		ServerName:   "PiChunk \u00bb One Chunk Creative Server",
-		MaxPlayers:   20,
-		ViewDistance: 10,
-		Chunks:       1,
+		ServerName:           "PiChunk \u00bb One Chunk Creative Server",
+		MaxPlayers:           20,
+		ViewDistance:         10,
+		Chunks:               1,
+		CompressionThreshold: 256,
 	}
 
 	file, err := os.Open("server.properties")
@@ -64,6 +66,10 @@ func loadConfig() {
 			if v, err := strconv.Atoi(val); err == nil {
 				serverConfig.Chunks = v
 			}
+		case "network-compression-threshold":
+			if v, err := strconv.Atoi(val); err == nil {
+				serverConfig.CompressionThreshold = v
+			}
 		}
 	}
 }
@@ -74,6 +80,7 @@ server-name=PiChunk \u00bb One Chunk Creative Server
 max-players=20
 view-distance=10
 chunks=1
+network-compression-threshold=256
 `
 	_ = os.WriteFile("server.properties", []byte(content), 0644)
 	fmt.Println("Created default server.properties")
